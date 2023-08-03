@@ -1,0 +1,230 @@
+---
+title: "Calculating statistics for Scottish CoM"
+author: "Dave"
+format: html
+editor: visual
+---
+
+## Houskeeping
+
+### Libraries
+
+```{r libs}
+library(fs)
+library(here)
+library(stringr)
+library(purrr)
+library(vroom)
+library(dplyr)
+```
+
+## Calculate overlaps
+
+### Load data
+
+#### Load CoM Overlaps Data
+
+```{r loadOverlaps}
+read_overlaps <- function(area_code){
+  
+  overlap_files <-
+    dir_ls(here(str_c("com-", area_code, "-overlaps_scotland")))
+  
+  names(overlap_files) <-
+    str_extract(overlap_files, "(?<=/)[^/]+(?=\\.csv)") |>
+    str_replace_all("-", "_")
+  
+  overlaps <- map(overlap_files, vroom, col_types = "cd")
+}
+
+
+oa_overlaps <- read_overlaps("oa")
+dz_overlaps <- read_overlaps("dz")
+```
+
+#### Load census statistics
+
+```{r loadStats}
+get_census_files = function(area_code){
+  
+  area_glob = str_c("*_", area_code, "_*")  
+  census_files <- dir_ls(here("census-data_scotland"), glob = area_glob)
+  
+  area_code_file_regex <- 
+    str_c("(?<=/scotland_).+(?=_", area_code, "_\\d{4})")
+
+  names(census_files) <- 
+    str_extract(census_files, area_code_file_regex) |> 
+    str_replace_all("-", "_")
+  
+  return(census_files)
+}
+
+oa_census_files <- get_census_files("oa")
+dz_census_files <- get_census_files("dz")
+
+oa_census_data <- map(oa_census_files, readRDS)
+dz_census_data <- map(dz_census_files, readRDS)
+```
+
+### Preprocess data
+
+#### Filter unused DZ/OA
+
+```{r filterUnused}
+used_oa <-
+  map(oa_overlaps, pull, oa_2011_code) |> 
+  reduce(c) |> 
+  unique()
+
+used_dz <- 
+  map(dz_overlaps, pull, dz_2011_code) |> 
+  reduce(c) |> 
+  unique()
+
+oa_census_data <- map(oa_census_data, filter, oa_code %in% used_oa)
+dz_census_data <- map(dz_census_data, filter, dz_2011_code %in% used_dz)
+
+rm(used_oa, used_dz)
+```
+
+### Join census data to overlap tables
+
+```{r joinOverlapData}
+oa_overlaps <- 
+  map(oa_overlaps,
+      \(x){
+        map(oa_census_data, 
+            \(y){
+              left_join(x, y, by = c("oa_2011_code" = "oa_code")) }) })
+
+dz_overlaps <- 
+  map(dz_overlaps,
+      \(x){
+        map(dz_census_data, 
+            \(y){
+              left_join(x, y, by = c("dz_2011_code")) }) })
+```
+
+### Calulate com area stats
+
+```{r calculateComAreaStats}
+calculate_com_stats <- function(x, ratio_col){
+  
+  ratio_col <- enexpr(ratio_col)
+  
+  mutate(x,
+         across(
+           ## In every numeric column (except the 'ratio' column)
+           where(is.numeric) & !(!!ratio_col),
+           ## Multiply the numbers by the ratio numbers
+           \(y) y * !!ratio_col )) |> 
+    select(-!!ratio_col)
+}
+
+oa_com_stats <- 
+  map(oa_overlaps, map, calculate_com_stats, ratio_oa_intersection_com)
+dz_com_stats <-
+  map(dz_overlaps, map, calculate_com_stats, ratio_dz_intersection_com)
+```
+
+### Create CoM Summaries
+
+```{r createComSummaries}
+dz_com_summaries <- 
+  imap(dz_com_stats, 
+       \(x,y){
+         map(x,
+             \(z){
+               ungroup(z) |>
+                 summarise(across(where(is.numeric), sum)) |> 
+                 mutate(com = y) |> 
+                 relocate(com) }) })
+
+oa_com_summaries <- 
+  imap(oa_com_stats, 
+       \(x,y){
+         map(x,
+             \(z){
+               ungroup(z) |>
+                 summarise(across(where(is.numeric), sum)) |> 
+                 mutate(com = y) |> 
+                 relocate(com) }) })
+
+dz_com_summaries <- pmap(dz_com_summaries, list)
+oa_com_summaries <- pmap(oa_com_summaries, list)
+
+dz_com_summaries <- map(dz_com_summaries, reduce, rbind)
+oa_com_summaries <- map(oa_com_summaries, reduce, rbind)
+
+com_summaries <- c(dz_com_summaries, oa_com_summaries)
+
+rm(dz_com_summaries, oa_com_summaries)
+```
+
+## Save data
+
+### save summaries
+
+```{r saveSummaries}
+com_census_data <- dir_create(here("com-census-data"))
+summaries_dir <- dir_create(com_census_data, "all-com-summaries")
+
+iwalk(com_summaries,
+     \(x, y){
+       file_name <- here(
+         summaries_dir,
+         str_c(
+           "scottish-com_",
+           str_replace_all(y, "_", "-"),
+           "_2011.csv"))
+       
+       vroom_write(x, file_name, delim = ",")
+     })
+```
+
+### Save CoM Data
+
+```{r saveComData}
+com <-
+  names(oa_com_stats) |> 
+  str_replace_all("_", "-")
+
+com_dirs <- dir_create(com_census_data, com)
+
+iwalk(oa_com_stats,
+      \(com_data_list, com_name){
+        
+        iwalk(com_data_list,
+              \(stat_tibble, stat_name){
+                
+                                neat_com_name = str_replace_all(com_name, "_", "-")
+                neat_stat_name = str_replace_all(stat_name, "_", "-")
+                
+                save_path =
+                  str_c(com_census_data, "/", neat_com_name, "/",
+                        neat_stat_name, "_oa_2011.csv")
+                
+                vroom_write(
+                  stat_tibble,
+                  file = save_path,
+                  delim = ",") }) })
+
+iwalk(dz_com_stats,
+      \(com_data_list, com_name){
+        
+        iwalk(com_data_list,
+              \(stat_tibble, stat_name){
+                
+                neat_com_name = str_replace_all(com_name, "_", "-")
+                neat_stat_name = str_replace_all(stat_name, "_", "-")
+                
+                save_path =
+                  str_c(com_census_data, "/", neat_com_name, "/",
+                        neat_stat_name, "_dz_2011.csv")
+                
+                vroom_write(
+                  stat_tibble,
+                  file = save_path,
+                  delim = ",") }) })
+```
