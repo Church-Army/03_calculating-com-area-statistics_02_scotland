@@ -135,7 +135,7 @@ iwalk(com_summaries,
          str_c(
            "scottish-com_",
            str_replace_all(y, "_", "-"),
-           "_2011.csv"))
+           ".csv"))
        
        vroom_write(x, file_name, delim = ",")
      })
@@ -161,7 +161,7 @@ iwalk(oa_com_stats,
                 
                 save_path =
                   str_c(com_census_data, "/", neat_com_name, "/",
-                        neat_stat_name, "_oa_2011.csv")
+                        neat_stat_name, "_oa.csv")
                 
                 vroom_write(
                   stat_tibble,
